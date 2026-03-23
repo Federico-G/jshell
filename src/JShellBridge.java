@@ -29,29 +29,37 @@ public class JShellBridge {
     // Output capture state — shared with SwitchOutputStream
     static PrintStream realOut;
     static boolean capturing = false;
-    static StringBuilder outputBuffer = new StringBuilder();
+    static ByteArrayOutputStream outputBuffer = new ByteArrayOutputStream();
 
     /**
      * Switchable output stream. When capturing=true, writes to outputBuffer.
      * Otherwise forwards to the original System.out (realOut).
+     *
+     * Uses ByteArrayOutputStream (not StringBuilder) so multi-byte UTF-8
+     * characters (tildes, accents, etc.) are preserved correctly.
      *
      * Named static class (not anonymous) to avoid generating JShellBridge$1.class —
      * each extra .class file must be separately loaded via cheerpOSAddStringFile.
      */
     static class SwitchOutputStream extends OutputStream {
         public void write(int b) {
-            if (capturing) outputBuffer.append((char) b);
+            if (capturing) outputBuffer.write(b);
             else if (realOut != null) realOut.write(b);
         }
         public void write(byte[] b, int off, int len) {
             if (capturing) {
-                for (int i = off; i < off + len; i++) outputBuffer.append((char)(b[i] & 0xFF));
+                outputBuffer.write(b, off, len);
             } else if (realOut != null) realOut.write(b, off, len);
         }
         public void flush() { if (realOut != null) realOut.flush(); }
     }
 
     private static final PrintStream switchStream = new PrintStream(new SwitchOutputStream());
+
+    /** Write a string to outputBuffer as UTF-8 bytes */
+    private static void bufferWrite(String s) {
+        try { outputBuffer.write(s.getBytes("UTF-8")); } catch (Exception e) { /* ignore */ }
+    }
 
     /**
      * Initialize JShell with local execution engine.
@@ -118,7 +126,7 @@ public class JShellBridge {
     public static String eval(String cellCode) {
         if (shell == null) return "ERROR: JShell not initialized";
         try {
-            outputBuffer.setLength(0);
+            outputBuffer.reset();
             capturing = true;
             StringBuilder errors = new StringBuilder();
 
@@ -164,7 +172,7 @@ public class JShellBridge {
 
             capturing = false;
             switchStream.flush();
-            String output = outputBuffer.toString();
+            String output = outputBuffer.toString("UTF-8");
             if (errors.length() > 0) {
                 // Prefix each error line with @@ERR@@ so JS can color them separately
                 StringBuilder combined = new StringBuilder();
@@ -333,20 +341,18 @@ public class JShellBridge {
 
                 } else if (s instanceof MethodSnippet ms) {
                     boolean isNew = e.previousStatus() == Snippet.Status.NONEXISTENT;
-                    outputBuffer.append("|  ").append(isNew ? "created" : "modified")
-                        .append(" method ").append(ms.name())
-                        .append("(").append(ms.parameterTypes()).append(")");
+                    String msg = "|  " + (isNew ? "created" : "modified")
+                        + " method " + ms.name() + "(" + ms.parameterTypes() + ")";
                     // Forward reference warning
                     if (status == Snippet.Status.RECOVERABLE_DEFINED
                         || status == Snippet.Status.RECOVERABLE_NOT_DEFINED) {
                         List<String> deps = shell.unresolvedDependencies(ms).toList();
                         if (!deps.isEmpty()) {
-                            outputBuffer.append(", however, it cannot be invoked until ")
-                                .append(String.join(", and ", deps))
-                                .append(" are declared");
+                            msg += ", however, it cannot be invoked until "
+                                + String.join(", and ", deps) + " are declared";
                         }
                     }
-                    outputBuffer.append("\n");
+                    bufferWrite(msg + "\n");
 
                 } else if (s instanceof TypeDeclSnippet ts) {
                     boolean isNew = e.previousStatus() == Snippet.Status.NONEXISTENT;
@@ -354,9 +360,8 @@ public class JShellBridge {
                         : s.subKind() == Snippet.SubKind.INTERFACE_SUBKIND ? "interface"
                         : s.subKind() == Snippet.SubKind.ENUM_SUBKIND ? "enum"
                         : s.subKind() == Snippet.SubKind.RECORD_SUBKIND ? "record" : "type";
-                    outputBuffer.append("|  ").append(isNew ? "created" : "modified")
-                        .append(" ").append(kind).append(" ")
-                        .append(ts.name()).append("\n");
+                    bufferWrite("|  " + (isNew ? "created" : "modified")
+                        + " " + kind + " " + ts.name() + "\n");
                 }
                 // ImportSnippet, StatementSnippet — no auto-display needed
             }

@@ -320,9 +320,10 @@ Shortcuts:
                     ? await jshellBridge.diagnose(code.replace(/^\/diag\s+/, ''))
                     : await jshellBridge.eval(code);
                 const javaResult = jResult != null ? await jResult.toString() : '';
-                // Only wait for console DOM if Java didn't already return output
-                // (avoids 150ms timeout for no-output statements like for loops)
-                if (!javaResult.trim()) await waitForConsole();
+                // Always wait for CheerpJ to flush stdout to #console DOM.
+                // CheerpJ routes System.out asynchronously — output may arrive
+                // after the Java eval() call returns, especially on first execution.
+                await waitForConsole();
                 const consoleOutput = flushConsole().trim();
 
                 const combined = [javaResult.trim(), consoleOutput].filter(Boolean).join('\n');
