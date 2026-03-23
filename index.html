@@ -1,0 +1,812 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+    <title>JShell — Java 17 in the Browser</title>
+    <script src="https://cjrtnc.leaningtech.com/4.2/loader.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace; background: #0a0a1a; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+        /* Header */
+        .header { background: #12122a; border-bottom: 1px solid #2a2a4a; padding: 8px 16px; display: flex; align-items: center; gap: 10px; font-size: 13px; flex-shrink: 0; }
+        .header h1 { font-size: 14px; color: #7ec8e3; font-weight: 600; }
+        .header .sep { color: #2a2a4a; }
+        .header .version { color: #556; font-size: 11px; }
+        .header .spacer { flex: 1; }
+        .header .status { color: #556; font-size: 12px; }
+        .header .status.ready { color: #4ecca3; }
+        .header button { background: #2a2a4a; color: #999; border: 1px solid #3a3a5a; padding: 3px 10px; border-radius: 3px; font-size: 11px; cursor: pointer; font-family: inherit; }
+        .header button:hover { background: #3a3a5a; color: #fff; }
+
+        /* Console output */
+        .console { flex: 1; overflow-y: auto; padding: 12px 16px; font-size: 14px; line-height: 1.6; }
+        .console .entry { margin-bottom: 2px; white-space: pre-wrap; }
+        .console .prompt { color: #7ec8e3; user-select: none; }
+        .console .input-text { color: #e0e0e0; white-space: pre-wrap; }
+        .console .output { color: #4ecca3; white-space: pre-wrap; }
+        .console .error { color: #ff6b6b; white-space: pre-wrap; }
+        .console .info { color: #556; font-size: 12px; white-space: pre-wrap; }
+        .console .exception { color: #ffa07a; white-space: pre-wrap; }
+
+        /* Input row */
+        .input-row { display: flex; align-items: flex-start; padding: 8px 16px 12px; background: #12122a; border-top: 1px solid #2a2a4a; flex-shrink: 0; }
+        .input-row .prompt { color: #7ec8e3; padding: 6px 0; margin-right: 8px; flex-shrink: 0; user-select: none; }
+        .input-row textarea { flex: 1; background: transparent; color: #e0e0e0; border: none; outline: none; font-family: inherit; font-size: 14px; resize: none; line-height: 1.6; padding: 6px 0; height: 28px; overflow: hidden; }
+        .run-btn { background: none; border: 1px solid #3a3a5a; color: #4ecca3; padding: 4px 10px; border-radius: 3px; cursor: pointer; font-size: 14px; flex-shrink: 0; margin-left: 6px; font-family: inherit; align-self: center; }
+        .run-btn:hover { background: #1a3a2a; }
+        .run-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+        /* Loading */
+        .loading { display: flex; flex-direction: column; align-items: center; justify-content: center; flex: 1; gap: 16px; }
+        .loading h2 { color: #7ec8e3; font-weight: 400; font-size: 18px; }
+        .loading p { color: #556; font-size: 13px; }
+        .loading.hidden { display: none; }
+        @keyframes pulse { 0%, 100% { opacity: .3; } 50% { opacity: 1; } }
+        .loading .dots span { animation: pulse 1.4s infinite; }
+        .loading .dots span:nth-child(2) { animation-delay: 0.2s; }
+        .loading .dots span:nth-child(3) { animation-delay: 0.4s; }
+
+        /* CheerpJ stdout capture — hidden */
+        #console { position: absolute; left: -9999px; top: -9999px; }
+
+        /* Mobile */
+        @media (max-width: 600px) {
+            .header { padding: 6px 10px; gap: 6px; }
+            .header .version, .header .hint { display: none; }
+            .console { padding: 8px 10px; font-size: 13px; }
+            .input-row { padding: 6px 10px 8px; }
+            .input-row textarea { font-size: 13px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>jshell</h1>
+        <span class="sep">|</span>
+        <span class="version">Java 17</span>
+        <span class="spacer"></span>
+        <button onclick="handleCommand('/clear')">Clear</button>
+        <button onclick="handleCommand('/reset')">Reset</button>
+        <span class="status" id="status">loading...</span>
+    </div>
+
+    <div class="loading" id="loading">
+        <h2>JShell</h2>
+        <p id="loading-status">Initializing<span class="dots"><span>.</span><span>.</span><span>.</span></span></p>
+    </div>
+
+    <div class="console" id="output" style="display:none"></div>
+
+    <div class="input-row" id="input-row" style="display:none">
+        <span class="prompt">jshell&gt;</span>
+        <textarea id="input" rows="1" autofocus placeholder="Type Java code..." disabled></textarea>
+        <button class="run-btn" id="runBtn" onclick="evalInput()" disabled title="Run (Enter)">&#9654;</button>
+    </div>
+
+    <!-- CheerpJ routes System.out here -->
+    <pre id="console"></pre>
+
+    <script>
+        const outputEl = document.getElementById('output');
+        const inputEl = document.getElementById('input');
+        const statusEl = document.getElementById('status');
+        const loadingEl = document.getElementById('loading');
+        const loadingStatus = document.getElementById('loading-status');
+        const consoleEl = document.getElementById('console');
+        const inputRow = document.getElementById('input-row');
+
+        let jshellBridge = null;
+        let evalBusy = false;
+        let history = [];
+        let historyIdx = -1;
+
+        // ============================================================
+        // CheerpJ console capture
+        // ============================================================
+        let consoleSnapshot = '';
+        function flushConsole() {
+            const text = consoleEl.textContent;
+            const newText = text.slice(consoleSnapshot.length);
+            consoleSnapshot = text;
+            return newText;
+        }
+        function clearCheerpjConsole() {
+            consoleEl.textContent = '';
+            consoleSnapshot = '';
+        }
+
+        // Wait for CheerpJ to flush stdout to #console DOM (or timeout)
+        function waitForConsole(timeoutMs = 150) {
+            return new Promise(resolve => {
+                // If there's already new content, resolve immediately
+                if (consoleEl.textContent.length > consoleSnapshot.length) {
+                    resolve();
+                    return;
+                }
+                let resolved = false;
+                const done = () => { if (!resolved) { resolved = true; observer.disconnect(); resolve(); } };
+                const observer = new MutationObserver(done);
+                observer.observe(consoleEl, { childList: true, characterData: true, subtree: true });
+                setTimeout(done, timeoutMs); // fallback if no output
+            });
+        }
+
+        // ============================================================
+        // Display helpers
+        // ============================================================
+        let userScrolledUp = false;
+        outputEl?.addEventListener('scroll', () => {
+            const gap = outputEl.scrollHeight - outputEl.scrollTop - outputEl.clientHeight;
+            userScrolledUp = gap > 60;
+        });
+
+        function appendToOutput(html) {
+            outputEl.insertAdjacentHTML('beforeend', html);
+            if (!userScrolledUp) outputEl.scrollTop = outputEl.scrollHeight;
+        }
+
+        function showInput(code) {
+            const lines = esc(code).split('\n');
+            const html = lines.map((line, i) =>
+                `<span class="prompt">${i === 0 ? 'jshell&gt;' : '   ...'}</span> <span class="input-text">${line}</span>`
+            ).join('\n');
+            appendToOutput(`<div class="entry">${html}</div>`);
+        }
+
+        function showOutput(text) {
+            if (!text) return;
+            // Separate exception lines for distinct styling
+            const lines = text.split('\n');
+            const html = lines.map(line => {
+                if (line.startsWith('Exception ')) {
+                    return `<span class="exception">${esc(line)}</span>`;
+                }
+                return `<span class="output">${esc(line)}</span>`;
+            }).join('\n');
+            appendToOutput(`<div class="entry">${html}</div>`);
+        }
+
+        function showError(text) {
+            if (text) appendToOutput(`<div class="entry"><span class="error">${esc(text)}</span></div>`);
+        }
+
+        function showInfo(text) {
+            appendToOutput(`<div class="entry"><span class="info">${esc(text)}</span></div>`);
+        }
+
+        function esc(s) {
+            return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        // Auto-focus input when user starts typing (not on click — allows text selection)
+        document.addEventListener('keydown', (e) => {
+            if (document.activeElement === inputEl) return;
+            if (e.ctrlKey || e.metaKey || e.altKey) return;
+            if (e.key.length === 1 || e.key === 'Backspace' || e.key === 'Delete') {
+                inputEl.focus();
+            }
+        });
+
+        // ============================================================
+        // Engine
+        // ============================================================
+        async function loadPrecompiled(className) {
+            const resp = await fetch(`precompiled/${className}.class`);
+            if (!resp.ok) throw new Error(`Failed to load ${className}.class`);
+            cheerpOSAddStringFile(`/str/${className}.class`, new Uint8Array(await resp.arrayBuffer()));
+        }
+
+        async function initEngine() {
+            loadingStatus.innerHTML = 'Initializing CheerpJ<span class="dots"><span>.</span><span>.</span><span>.</span></span>';
+            await cheerpjInit({ status: 'none', version: 17 });
+
+            loadingStatus.innerHTML = 'Loading JShell<span class="dots"><span>.</span><span>.</span><span>.</span></span>';
+            await loadPrecompiled('JShellBridge');
+            await loadPrecompiled('JShellBridge$SwitchOutputStream');
+
+            loadingStatus.innerHTML = 'Starting JShell<span class="dots"><span>.</span><span>.</span><span>.</span></span>';
+            const lib = await cheerpjRunLibrary(
+                '/app/jdk.jshell.jar:/app/jdk.compiler_17.jar:/str/');
+            jshellBridge = await lib.JShellBridge;
+
+            const initResult = await jshellBridge.init();
+            const initStr = initResult != null ? await initResult.toString() : '';
+            if (!initStr.includes('OK')) throw new Error('JShell init: ' + initStr);
+
+            loadingStatus.innerHTML = 'Warming up compiler<span class="dots"><span>.</span><span>.</span><span>.</span></span>';
+            clearCheerpjConsole();
+            await jshellBridge.eval('1+1');
+            flushConsole();
+            await jshellBridge.reset(); // start fresh — warmup created $1
+            clearCheerpjConsole();
+
+            // Ready
+            loadingEl.classList.add('hidden');
+            outputEl.style.display = '';
+            inputRow.style.display = '';
+            inputEl.disabled = false;
+            document.getElementById('runBtn').disabled = false;
+            statusEl.textContent = 'ready';
+            statusEl.classList.add('ready');
+
+            showInfo('JShell (Java 17) running in the browser via CheerpJ');
+            showInfo('Type Java code and press Enter. /help for commands.\n');
+            inputEl.focus();
+        }
+
+        // ============================================================
+        // Commands
+        // ============================================================
+        const HELP_TEXT = `/help     — show this help
+/clear    — clear the console
+/reset    — reset JShell session (clear all state)
+/test     — run regression test suite
+/diag <code> — show JShell internals for given code
+
+Shortcuts:
+  Enter        — run code
+  Shift+Enter  — new line
+  Up/Down      — command history`;
+
+        function handleCommand(cmd) {
+            if (cmd === '/help') {
+                showInfo(HELP_TEXT);
+            } else if (cmd === '/clear') {
+                outputEl.innerHTML = '';
+            } else if (cmd === '/reset') {
+                resetSession();
+            } else if (cmd === '/test') {
+                runTests();
+            }
+        }
+
+        async function resetSession() {
+            if (jshellBridge) {
+                await jshellBridge.reset();
+            }
+            outputEl.innerHTML = '';
+            showInfo('Session reset — all state cleared\n');
+            statusEl.textContent = 'ready';
+            statusEl.classList.add('ready');
+        }
+
+        // ============================================================
+        // Eval
+        // ============================================================
+        async function evalInput() {
+            const code = inputEl.value.trimEnd();
+            if (!code.trim()) return;
+            if (evalBusy) return;
+            evalBusy = true;
+
+            history.push(code);
+            historyIdx = history.length;
+            showInput(code);
+            inputEl.value = '';
+            autoResize();
+
+            // Handle commands
+            const trimmed = code.trim();
+            if (trimmed.startsWith('/')) {
+                if (trimmed === '/test') { evalBusy = false; runTests(); return; }
+                if (trimmed.startsWith('/diag ')) {
+                    await evalCode(trimmed, true);
+                } else {
+                    handleCommand(trimmed);
+                }
+                evalBusy = false;
+                statusEl.textContent = 'ready';
+                statusEl.classList.add('ready');
+                inputEl.focus();
+                return;
+            }
+
+            await evalCode(code, false);
+            evalBusy = false;
+            inputEl.focus();
+        }
+
+        async function evalCode(code, isDiag) {
+            statusEl.textContent = 'running...';
+            statusEl.classList.remove('ready');
+
+            const t0 = performance.now();
+            try {
+                clearCheerpjConsole();
+                const jResult = isDiag
+                    ? await jshellBridge.diagnose(code.replace(/^\/diag\s+/, ''))
+                    : await jshellBridge.eval(code);
+                const javaResult = jResult != null ? await jResult.toString() : '';
+                // Only wait for console DOM if Java didn't already return output
+                // (avoids 150ms timeout for no-output statements like for loops)
+                if (!javaResult.trim()) await waitForConsole();
+                const consoleOutput = flushConsole().trim();
+
+                const combined = [javaResult.trim(), consoleOutput].filter(Boolean).join('\n');
+
+                if (combined.includes('@@ERR@@')) {
+                    // Split: error lines (@@ERR@@ prefix) in red, output lines in green
+                    const lines = combined.split('\n');
+                    const errLines = lines.filter(l => l.startsWith('@@ERR@@')).map(l => l.slice(7));
+                    const outLines = lines.filter(l => !l.startsWith('@@ERR@@') && l.trim());
+                    if (outLines.length) showOutput(outLines.join('\n'));
+                    if (errLines.length) showError(errLines.join('\n'));
+                } else if (combined) {
+                    showOutput(combined);
+                }
+            } catch (e) {
+                try {
+                    if (e && e.message) showError('Error: ' + e.message);
+                    else if (e && typeof e.getMessage === 'function') {
+                        const msg = await e.getMessage();
+                        showError('Error: ' + (msg ? await msg.toString() : 'unknown'));
+                    } else showError('Error (see browser console)');
+                } catch (_) {
+                    showError('Error (see browser console)');
+                }
+            }
+
+            const ms = Math.round(performance.now() - t0);
+            statusEl.textContent = `ready (${ms}ms)`;
+            statusEl.classList.add('ready');
+        }
+
+        // ============================================================
+        // Input handling
+        // ============================================================
+        function autoResize() {
+            inputEl.style.height = '28px';
+            inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + 'px';
+        }
+
+        inputEl.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                evalInput();
+            }
+            if (e.key === 'ArrowUp') {
+                if (historyIdx <= 0 && history.length > 0) {
+                    historyIdx = history.length;
+                }
+                if (historyIdx > 0) {
+                    historyIdx--;
+                    inputEl.value = history[historyIdx];
+                    autoResize();
+                }
+                e.preventDefault();
+            }
+            if (e.key === 'ArrowDown') {
+                if (historyIdx < history.length - 1) {
+                    historyIdx++;
+                    inputEl.value = history[historyIdx];
+                } else {
+                    historyIdx = history.length;
+                    inputEl.value = '';
+                }
+                autoResize();
+                e.preventDefault();
+            }
+        });
+
+        inputEl.addEventListener('input', autoResize);
+
+        // ============================================================
+        // Test suite (accessible via /test)
+        // ============================================================
+        async function runEval(code) {
+            clearCheerpjConsole();
+            const jResult = await jshellBridge.eval(code);
+            const javaResult = jResult != null ? await jResult.toString() : '';
+            await new Promise(r => setTimeout(r, 250));
+            const consoleOutput = flushConsole().trim();
+            return [javaResult.trim(), consoleOutput].filter(Boolean).join('\n').trim();
+        }
+
+        async function runTests() {
+            await resetSession();
+            showInfo('Running test suite...\n');
+            let pass = 0, fail = 0;
+            let $n = 0; // mirrors Java scratchCounter
+
+            // Helpers: track $N counter (mirrors Java scratchCounter)
+            // $(val): expression that displays "$N ==> val"
+            // skip(): declaration/statement that consumes an ID slot but doesn't display $N
+            function $(val) { return '$' + (++$n) + ' ==> ' + val; }
+            function skip() { $n++; }
+
+            async function test(input, expected, label, mode = 'exact') {
+                const actual = await runEval(input);
+                let ok;
+                if (expected === null) {
+                    ok = true;
+                } else if (mode === 'contains') {
+                    ok = actual.includes(expected);
+                } else {
+                    ok = actual === expected;
+                }
+                if (ok) pass++; else fail++;
+                const icon = ok ? '\u2705' : '\u274C';
+                if (ok) {
+                    showOutput(`${icon} ${label}`);
+                } else {
+                    showError(`${icon} ${label}\n   expected: ${expected}\n   actual:   ${actual}`);
+                }
+            }
+
+            // === Literals ===
+            showInfo('--- Literals ---');
+            await test('42', $(42), 'literal int');
+            await test('"hello"', $('"hello"'), 'literal string');
+            await test('true', $('true'), 'literal boolean');
+            await test('3.14', $(3.14), 'literal double');
+            await test("'A'", $("'A'"), 'literal char');
+
+            // === Variables ===
+            showInfo('\n--- Variables ---');
+            skip(); await test('int x = 10', 'x ==> 10', 'var declaration');
+            await test('x', ($n++, 'x ==> 10'), 'bare var read');
+            await test('x + 5', $(15), 'expression');
+            skip(); await test('int x = 99', 'x ==> 99', 'var redefinition');
+            await test('x', ($n++, 'x ==> 99'), 'var after redefinition');
+            skip(); await test('var y = "auto"', 'y ==> "auto"', 'var type inference');
+            await test('y', ($n++, 'y ==> "auto"'), 'var inferred read');
+
+            // === Increment/decrement ===
+            showInfo('\n--- Increment/decrement ---');
+            skip(); await test('int c = 0', 'c ==> 0', 'counter init');
+            await test('c++', $(0), 'post-increment value');
+            await test('c', ($n++, 'c ==> 1'), 'c after c++');
+            await test('++c', $(2), '++c pre-increment');
+            await test('c', ($n++, 'c ==> 2'), 'c after ++c');
+
+            // === Strings ===
+            showInfo('\n--- Strings ---');
+            skip(); await test('String s = "world"', 's ==> "world"', 'string var');
+            await test('s.length()', $(5), 'string method');
+            await test('"hello " + s', $('"hello world"'), 'string concat');
+            await test('"Hello World".toLowerCase().contains("world")', $('true'), 'chained string methods');
+
+            // === Multi-statement ===
+            showInfo('\n--- Multi-statement ---');
+            skip(); skip(); // int a, int b declarations consume slots
+            await test('int a = 1; int b = 2; a + b', 'a ==> 1\nb ==> 2\n' + $(3), 'multi-stmt with trailing expr');
+
+            // === Methods ===
+            showInfo('\n--- Methods ---');
+            skip(); await test('int square(int n) { return n * n; }', '|  created method square(int)', 'method def');
+            await test('square(7)', $(49), 'method call');
+            skip(); await test('int add(int a, int b) { return a + b; }', '|  created method add(int,int)', 'top-level method');
+            await test('add(3, 4)', $(7), 'top-level method call');
+
+            // === Overloading ===
+            showInfo('\n--- Overloading ---');
+            skip(); await test('String fmt(int n) { return "int:" + n; }', '|  created method fmt(int)', 'overload 1');
+            skip(); await test('String fmt(String s) { return "str:" + s; }', '|  created method fmt(String)', 'overload 2');
+            await test('fmt(42)', $('"int:42"'), 'overload dispatch int');
+            await test('fmt("hi")', $('"str:hi"'), 'overload dispatch string');
+
+            // === Varargs ===
+            showInfo('\n--- Varargs ---');
+            skip(); await test('int sum(int... nums) { int t = 0; for (int n : nums) t += n; return t; }',
+                '|  created method sum(int...)', 'varargs method');
+            await test('sum(1, 2, 3, 4, 5)', $(15), 'varargs call');
+
+            // === Records ===
+            showInfo('\n--- Records ---');
+            skip(); await test('record Pt(int x, int y) {}', '|  created record Pt', 'record def');
+            await test('new Pt(3, 4)', $('Pt[x=3, y=4]'), 'record instance');
+
+            // === Classes ===
+            showInfo('\n--- Classes ---');
+            skip(); await test('class Animal { String name; Animal(String n) { name = n; } String speak() { return name + " speaks"; } }',
+                '|  created class Animal', 'class def');
+            await test('new Animal("Dog").speak()', $('"Dog speaks"'), 'class instance + method');
+
+            // === Enums ===
+            showInfo('\n--- Enums ---');
+            skip(); await test('enum Color { RED, GREEN, BLUE }', '|  created enum Color', 'enum def');
+            await test('Color.GREEN', $('GREEN'), 'enum value');
+            await test('Color.values().length', $(3), 'enum values length');
+
+            // === Interfaces ===
+            showInfo('\n--- Interfaces ---');
+            skip(); await test('interface Greeter { String greet(String name); }', '|  created interface Greeter', 'interface def');
+            skip(); await test('class FormalGreeter implements Greeter { public String greet(String name) { return "Good day, " + name; } }',
+                '|  created class FormalGreeter', 'class implements interface');
+            skip(); await test('Greeter g = new FormalGreeter()', 'g ==>', 'polymorphic assignment', 'contains');
+            await test('g.greet("Alice")', $('"Good day, Alice"'), 'interface method call');
+
+            // === Abstract classes ===
+            showInfo('\n--- Abstract classes ---');
+            skip(); await test('abstract class Shape { abstract double area(); String desc() { return "Shape: area=" + area(); } }',
+                '|  created class Shape', 'abstract class');
+            skip(); await test('class Circle extends Shape { double r; Circle(double r) { this.r = r; } double area() { return Math.PI * r * r; } }',
+                '|  created class Circle', 'concrete subclass');
+            skip(); await test('Shape sh = new Circle(5)', 'sh ==>', 'abstract ref to subclass', 'contains');
+            await test('Math.round(sh.area())', $(79), 'polymorphic method call');
+            await test('sh.desc()', $('"Shape: area=78.53981633974483"'), 'inherited method');
+
+            // === Generics ===
+            showInfo('\n--- Generics ---');
+            skip(); await test('class Box<T> { T val; Box(T v) { val = v; } T get() { return val; } }',
+                '|  created class Box', 'generic class');
+            await test('new Box<>("hello").get()', $('"hello"'), 'generic diamond + method');
+
+            // === Lambdas ===
+            showInfo('\n--- Lambdas ---');
+            skip(); await test('java.util.function.Function<String,Integer> len = str -> str.length()',
+                'len ==>', 'lambda assignment', 'contains');
+            await test('len.apply("test")', $(4), 'lambda call');
+
+            // === Arrays ===
+            showInfo('\n--- Arrays ---');
+            skip(); await test('int[] arr = {10, 20, 30}', 'arr ==> int[3] { 10, 20, 30 }', '1D int array');
+            await test('arr[1]', $(20), 'array access');
+            await test('arr.length', $(3), 'array length');
+            skip(); await test('String[] names = {"Alice", "Bob"}', 'names ==> String[2] { "Alice", "Bob" }', '1D String array');
+            skip(); await test('int[][] grid = {{1,2},{3,4}}', 'grid ==> int[2][] { int[2] { 1, 2 }, int[2] { 3, 4 } }', '2D int array');
+            await test('new int[]{7, 8, 9}', $('int[3] { 7, 8, 9 }'), 'anonymous array');
+            await test([
+                'new String[]{"x", "y"}',
+                'new String[]{"x", "y"}'
+            ].join('\n'), $('String[2] { "x", "y" }') + '\n' + $('String[2] { "x", "y" }'), 'repeated anonymous array multiline');
+
+            // === Collections ===
+            showInfo('\n--- Collections ---');
+            skip(); await test('var list = new java.util.ArrayList<String>()', 'list ==> []', 'list init');
+            await test('list.add("a"); list.add("b"); list', $('true') + '\n' + $('true') + '\n' + ($n++, 'list ==> [a, b]'), 'multi-stmt + trailing list');
+            skip(); await test('var map = new java.util.HashMap<String,Integer>()', 'map ==> {}', 'map init');
+            await test('map.put("a", 1); map.put("b", 2); map.size()', $('null') + '\n' + $('null') + '\n' + $(2), 'map put + size');
+
+            // === Import ===
+            showInfo('\n--- Imports ---');
+            skip(); await test('import java.time.LocalDate', null, 'import');
+            await test('LocalDate.of(2026, 1, 1).getYear()', $(2026), 'imported class method');
+
+            // === Control flow ===
+            showInfo('\n--- Control flow ---');
+            skip(); await test('if (true) System.out.println("ok")', 'ok', 'if statement');
+            skip(); await test('for (int i = 0; i < 3; i++) System.out.print(i)', '012', 'for loop');
+            skip(); await test('int v = 10; v > 5 ? "big" : "small"', 'v ==> 10\n' + $('"big"'), 'ternary');
+
+            // === Math ===
+            showInfo('\n--- Math ---');
+            await test('Math.max(3, 7)', $(7), 'Math.max');
+            await test('Math.abs(-42)', $(42), 'Math.abs');
+            await test('0.0 / 0.0', $('NaN'), 'floating NaN');
+            await test('1.0 / 0.0', $('Infinity'), 'floating infinity');
+
+            // === Errors ===
+            showInfo('\n--- Compilation errors ---');
+            skip(); await test('undefined_var', '@@ERR@@', 'undefined var error', 'contains');
+            skip(); await test('int int = 5', '@@ERR@@', 'keyword as var name', 'contains');
+
+            // === Null ===
+            showInfo('\n--- Null handling ---');
+            skip(); await test('String ns = null', 'ns ==> null', 'null assignment');
+            skip(); await test('ns.length()', 'NullPointerException', 'NPE on null dereference', 'contains');
+
+            // === Exceptions (keep contains — messages vary) ===
+            showInfo('\n--- Exceptions ---');
+            skip(); await test('1 / 0', 'ArithmeticException', 'div by zero', 'contains');
+            skip(); await test('1 % 0', 'ArithmeticException', 'mod by zero (CheerpJ WASM: no throw)', 'contains');
+            skip(); await test('Integer.parseInt("x")', 'NumberFormatException', 'parseInt invalid', 'contains');
+            skip(); await test('new int[]{1,2,3}[10]', 'ArrayIndexOutOfBoundsException', 'array OOB', 'contains');
+            skip(); await test('Math.addExact(Integer.MAX_VALUE, 1)', 'ArithmeticException', 'integer overflow', 'contains');
+            skip(); await test('new int[-1]', 'NegativeArraySizeException', 'negative array size (CheerpJ: no throw)', 'contains');
+            // throw uses special path (no tryEvalAsExpression, no counter increment)
+            await test('throw new RuntimeException("boom")', 'RuntimeException', 'throw statement', 'contains');
+            skip(); await test('try { Integer.parseInt("x"); } catch (Exception e) { System.out.println("caught: " + e.getClass().getSimpleName()); }',
+                'caught: NumberFormatException', 'try/catch in user code');
+
+            // === JShell-specific behaviors ===
+            showInfo('\n--- Forward references ---');
+            skip(); await test([
+                'double volume(double radius) {',
+                '    return 4.0 / 3.0 * PI * cube(radius);',
+                '}'
+            ].join('\n'), 'cannot be invoked until', 'forward ref method def', 'contains');
+            skip(); await test('double PI = 3.1415926535', 'PI ==> 3.1415926535', 'resolve forward ref var');
+            skip(); await test('double cube(double x) { return x * x * x; }', '|  created method cube(double)', 'resolve forward ref method');
+            await test('String.format("%.2f", volume(2))', $('"33.51"'), 'forward refs resolved + call');
+
+            showInfo('\n--- Method redefinition ---');
+            skip(); await test('String twice(String s) { return s + s; }', '|  created method twice(String)', 'method def');
+            await test('twice("Ocean")', $('"OceanOcean"'), 'method call');
+            skip(); await test('String twice(String s) { return "Twice:" + s; }', '|  modified method twice(String)', 'method redefinition');
+            await test('twice("thing")', $('"Twice:thing"'), 'redefined method call');
+
+            showInfo('\n--- Variable type replacement ---');
+            skip(); await test('int xx = 45', 'xx ==> 45', 'int var');
+            skip(); await test('String xx = "hello"', 'xx ==> "hello"', 'replace int with String');
+            await test('xx', ($n++, 'xx ==> "hello"'), 'read replaced var');
+            await test('xx.length()', $(5), 'call method on replaced type');
+
+            showInfo('\n--- Nested/chained calls ---');
+            await test('twice(twice("x"))', $('"Twice:Twice:x"'), 'nested method calls');
+            await test('String.valueOf(Math.max(10, 20)).length()', $(2), 'chained static + instance');
+
+            showInfo('\n--- Void methods ---');
+            skip(); await test('void greetVoid(String name) { System.out.println("Hi " + name); }',
+                '|  created method greetVoid(String)', 'void method def');
+            skip(); await test('greetVoid("Alice")', 'Hi Alice', 'void method prints to stdout');
+
+            showInfo('\n--- Multiline class ---');
+            skip(); await test([
+                'class Person {',
+                '    String name;',
+                '    int age;',
+                '    Person(String name, int age) { this.name = name; this.age = age; }',
+                '    public String toString() { return name + " (" + age + ")"; }',
+                '}'
+            ].join('\n'), '|  created class Person', 'multiline class');
+            await test('new Person("Alice", 30)', $('Alice (30)'), 'class with toString');
+
+            showInfo('\n--- Semicolons optional ---');
+            skip(); await test('int noSemi = 77', 'noSemi ==> 77', 'var without semicolon');
+            await test('noSemi + 3', $(80), 'expr without semicolon');
+
+            showInfo('\n--- Assignment expressions ---');
+            skip(); await test('int ae = 0', 'ae ==> 0', 'var for assignment test');
+            await test('ae = 42', ($n++, 'ae ==> 42'), 'assignment as expression');
+            await test('ae += 8', ($n++, 'ae ==> 50'), 'compound assignment');
+            await test('ae', ($n++, 'ae ==> 50'), 'var after assignments');
+
+            showInfo('\n--- Multiline input (Shift+Enter) ---');
+            // Multiple independent statements on separate lines
+            skip(); skip(); skip(); skip(); // mx decl + mx= + mx+= + mx bare
+            await test([
+                'int mx = 5',
+                'mx = 10',
+                'mx += 3',
+                'mx'
+            ].join('\n'), 'mx ==> 13', 'multiline independent stmts', 'contains');
+
+            // Multiline method def
+            skip(); await test([
+                'int triple(int n) {',
+                '    return n * 3;',
+                '}'
+            ].join('\n'), '|  created method triple(int)', 'multiline method def');
+            await test('triple(7)', $(21), 'call multiline method');
+
+            // Mix: declarations + expression on separate lines
+            skip(); skip(); // p, q declarations
+            await test([
+                'int p = 10',
+                'int q = 20',
+                'p * q'
+            ].join('\n'), 'p ==> 10\nq ==> 20\n' + $(200), 'multiline decls + trailing expr');
+
+            // Multiline class
+            skip(); await test([
+                'class Counter {',
+                '    int val;',
+                '    Counter(int v) { val = v; }',
+                '    Counter inc() { val++; return this; }',
+                '    public String toString() { return "Counter(" + val + ")"; }',
+                '}'
+            ].join('\n'), '|  created class Counter', 'multiline class in shift+enter');
+            await test('new Counter(0).inc().inc().inc()', $('Counter(3)'), 'multiline class usage');
+
+            // Auto-semicolon: array initializers
+            skip(); skip(); // aa, gg declarations
+            await test([
+                'int[] aa = {1, 2, 3}',
+                'int[][] gg = {{4,5},{6,7}}',
+                'aa'
+            ].join('\n'), 'aa ==> int[3] { 1, 2, 3 }\ngg ==> int[2][] { int[2] { 4, 5 }, int[2] { 6, 7 } }\naa ==> int[3] { 1, 2, 3 }', 'multiline with array init (auto ;)');
+
+            // Auto-semicolon: incomplete method + call
+            skip(); skip(); // method decl + extra from preprocessMultiline
+            await test([
+                'int doubleUp(int n) {',
+                '    return n * 2;',
+                '}',
+                'doubleUp(21)'
+            ].join('\n'), $(42), 'multiline method + call', 'contains');
+
+            // Auto-semicolon: StringBuilder chain
+            skip(); skip(); skip(); skip(); // sb decl + 2 appends + toString
+            await test([
+                'var sb = new StringBuilder()',
+                'sb.append("hello")',
+                'sb.append(" world")',
+                'sb.toString()'
+            ].join('\n'), '"hello world"', 'multiline StringBuilder chain', 'contains');
+
+            // === Ultimate tests ===
+            showInfo('\n--- Ultimate: multi-step programs ---');
+
+            await test([
+                'int fib(int n) { return n <= 1 ? n : fib(n-1) + fib(n-2); }',
+                'fib(10)'
+            ].join('\n'), '55', 'fibonacci recursive', 'contains');
+
+            await test([
+                'class Builder {',
+                '    StringBuilder sb = new StringBuilder();',
+                '    Builder add(String s) { sb.append(s); return this; }',
+                '    String build() { return sb.toString(); }',
+                '}'
+            ].join('\n'), '|  created class Builder', 'builder class');
+            await test('new Builder().add("Hello").add(" ").add("World").build()', '"Hello World"', 'builder chain', 'contains');
+
+            await test('interface Stack<T> { void push(T item); T pop(); int size(); }',
+                '|  created interface Stack', 'generic interface');
+            await test([
+                'class ListStack<T> implements Stack<T> {',
+                '    java.util.List<T> items = new java.util.ArrayList<>();',
+                '    public void push(T item) { items.add(item); }',
+                '    public T pop() { return items.remove(items.size() - 1); }',
+                '    public int size() { return items.size(); }',
+                '}'
+            ].join('\n'), '|  created class ListStack', 'generic impl');
+            await test([
+                'Stack<String> stack = new ListStack<>();',
+                'stack.push("a"); stack.push("b"); stack.push("c");',
+                'stack.pop() + " " + stack.pop() + " (size=" + stack.size() + ")"'
+            ].join('\n'), 'c b (size=1)', 'generic stack operations', 'contains');
+
+            await test([
+                'var nums = java.util.List.of(1,2,3,4,5,6,7,8,9,10);',
+                'nums.stream().filter(n -> n % 2 == 0).map(n -> n * n).reduce(0, Integer::sum)'
+            ].join('\n'), '220', 'stream pipeline', 'contains');
+
+            await test([
+                'enum Planet {',
+                '    MERCURY(3.303e+23, 2.4397e6),',
+                '    EARTH(5.976e+24, 6.37814e6);',
+                '    final double mass, radius;',
+                '    Planet(double m, double r) { mass = m; radius = r; }',
+                '    double gravity() { return 6.67300E-11 * mass / (radius * radius); }',
+                '}'
+            ].join('\n'), '|  created enum Planet', 'enum with methods');
+            await test('String.format("%.1f", Planet.EARTH.gravity())', '9.8', 'enum method call', 'contains');
+
+            await test([
+                'abstract class Expr {}',
+                'class Num extends Expr { int val; Num(int v) { val = v; } }',
+                'class Add extends Expr { Expr left, right; Add(Expr l, Expr r) { left = l; right = r; } }',
+            ].join('\n'), '|  created class Expr', 'expression class hierarchy', 'contains');
+            await test([
+                'int evaluate(Expr e) {',
+                '    if (e instanceof Num n) return n.val;',
+                '    if (e instanceof Add a) return evaluate(a.left) + evaluate(a.right);',
+                '    return 0;',
+                '}',
+            ].join('\n'), '|  created method evaluate(Expr)', 'pattern matching method');
+            await test('evaluate(new Add(new Num(10), new Add(new Num(20), new Num(12))))', '42', 'recursive tree eval', 'contains');
+
+            await test([
+                'import java.util.function.*;',
+                'Function<Integer,Integer> doubleIt = x -> x * 2;',
+                'Function<Integer,Integer> addTen = x -> x + 10;',
+                'Function<Integer,Integer> combined = doubleIt.andThen(addTen);',
+                'combined.apply(5)'
+            ].join('\n'), '20', 'functional composition', 'contains');
+
+            await test([
+                'var results = new java.util.ArrayList<String>();',
+                'results.add("fib10=" + fib(10));',
+                'results.add("builder=" + new Builder().add("OK").build());',
+                'results.add("earth_g=" + String.format("%.0f", Planet.EARTH.gravity() * 10));',
+                'results.add("eval=" + evaluate(new Add(new Num(1), new Num(2))));',
+                'String.join(", ", results)'
+            ].join('\n'), 'fib10=55, builder=OK, earth_g=98, eval=3', 'cross-reference all definitions', 'contains');
+
+            // Summary
+            showInfo(`\n${pass} passed, ${fail} failed out of ${pass + fail} tests`);
+        }
+
+        // ============================================================
+        // Init
+        // ============================================================
+        initEngine().catch(e => {
+            loadingStatus.textContent = 'Failed: ' + (e.message || e);
+        });
+    </script>
+</body>
+</html>
