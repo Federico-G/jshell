@@ -207,8 +207,9 @@
             await loadPrecompiled('JShellBridge$SwitchOutputStream');
 
             loadingStatus.innerHTML = 'Starting JShell<span class="dots"><span>.</span><span>.</span><span>.</span></span>';
+            const jar = (name) => '/app' + new URL(name, location.href).pathname;
             const lib = await cheerpjRunLibrary(
-                '/app/jdk.jshell.jar:/app/jdk.compiler_17.jar:/str/');
+                jar('jdk.jshell.jar') + ':' + jar('jdk.compiler_17.jar') + ':/str/');
             jshellBridge = await lib.JShellBridge;
 
             const initResult = await jshellBridge.init();
