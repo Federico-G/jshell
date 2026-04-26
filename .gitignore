@@ -1,0 +1,15 @@
+# Build output (intermediate javac classes — final ones live in precompiled/)
+src/build/
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor swap files
+*.swp
+*~
