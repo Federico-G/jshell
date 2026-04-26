@@ -1,10 +1,11 @@
 #!/bin/bash
-# Build JShellBridge and copy to public/precompiled/
+# Build JShellBridge and copy to precompiled/
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SRC="$SCRIPT_DIR/src"
+ROOT="$SCRIPT_DIR/.."
+SRC="$SCRIPT_DIR"
 BUILD="$SCRIPT_DIR/build"
-OUT="$SCRIPT_DIR/../public/precompiled"
-CP="$SCRIPT_DIR/../public/jdk.jshell.jar;$SCRIPT_DIR/../public/jdk.compiler_17.jar"
+OUT="$ROOT/precompiled"
+CP="$ROOT/jdk.jshell.jar;$ROOT/jdk.compiler_17.jar"
 
 rm -rf "$BUILD" && mkdir -p "$BUILD" "$OUT"
 
