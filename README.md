@@ -62,7 +62,8 @@ In **developer mode**, additional commands are available:
 - **[CheerpJ](https://cheerpj.com)**: Full JVM running in WebAssembly (loaded from CDN).
 - **`jdk.compiler_17.jar`**: Java 17 compiler (`javac`), extracted from Temurin JDK 17.
 - **`jdk.jshell.jar`**: JShell engine + dependencies, with `TaskFactory` patched to use `ServiceLoader` (CheerpJ's `ToolProvider.getSystemJavaCompiler()` returns null otherwise).
-- **`JShellBridge.java`**: ~750-line bridge between JavaScript and the JShell API. Handles `$N` referenceability, exception capture inside compiled bytecode (CheerpJ silently swallows them otherwise), and a hybrid soft/hard reset that bypasses CheerpJ's 15-cycle close+build limit.
+- **`MhExecutionControl`**: a custom `LocalExecutionControl` subclass (patched into the `jdk.jshell.execution` package) that invokes the snippet's `do_it$` via `MethodHandle.invokeWithArguments` instead of `Method.invoke`. CheerpJ silently drops exceptions through `Method.invoke`; the MethodHandle path propagates them correctly, so `SnippetEvent.value()` and `.exception()` work natively.
+- **`JShellBridge.java`**: bridge between JavaScript and the JShell API. Handles `$N` referenceability via top-level `var` wrapping, prints exceptions + jshell-style `at (#N:L)` stack frames, and runs a hybrid soft/hard reset that bypasses CheerpJ's 15-cycle close+build limit.
 
 Total download: ~5.6 MB of JARs + CheerpJ runtime from CDN.
 
@@ -89,9 +90,8 @@ These are CheerpJ-specific deviations from real Java semantics. None affect norm
 
 - **`1 % 0`** silently returns `0` — CheerpJ's WASM doesn't trap mod-by-zero. Real Java throws `ArithmeticException`. *(Tested as a "canary" in `/test-errors`.)*
 - **`new int[-1]`** throws `ArithmeticException` instead of `NegativeArraySizeException`. *(Also a canary.)*
+- **JVM-thrown exception messages are often `null`** — e.g. real `ArithmeticException` from `1/0` carries `: / by zero`; CheerpJ's WASM raises the exception without setting the message field. User-thrown exceptions (`throw new RuntimeException("boom")`) keep their message intact.
 - **`shell.close() + new JShell.builder().build()`** is hardcoded to ~15 cycles per page in CheerpJ; after that, javac's `Names.Table` corrupts and any compile fails. We work around it by soft-resetting (drop snippets, keep JShell alive) and only doing a hard reset every 20 evals — budget capped at 14, with a warning before the cliff.
-- **`SnippetEvent.value()` and `.exception()`** always return `null`. Values come back via `shell.varValue()`; exceptions are caught by an `__safe(Supplier)` helper installed in the session.
-- **`shell.varValue()`** returns the type default (`0`/`null`/`false`) immediately after declaration; one subsequent `shell.eval` is needed to flush pending `<clinit>`. We invoke a no-op `__trigger()` method snippet for that.
 - **`cheerpjRunLibrary`** can only be called once per page. The only true "deep reset" is reloading the page.
 
 ## Credits

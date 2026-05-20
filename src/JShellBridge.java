@@ -8,17 +8,14 @@ import java.util.*;
  *
  * CheerpJ-specific behaviors we work around (see {@code /probe} for live state):
  * <ul>
- *   <li>{@code SnippetEvent.value()} and {@code .exception()} always return
- *       null — runtime results don't cross the WASM boundary. We read values
- *       via {@link JShell#varValue} and catch exceptions inside compiled
- *       bytecode through the {@code __safe(Supplier)} helper.</li>
- *   <li>{@code shell.varValue} returns the type default (0/null/false)
- *       immediately after declaration — the synthetic class's {@code <clinit>}
- *       runs lazily. Any subsequent {@code shell.eval} flushes it, so we
- *       invoke a no-op {@code __trigger()} method (see {@link #triggerClinit}).</li>
- *   <li>{@code LocalExecutionControl} silently swallows runtime exceptions
- *       (e.g. {@code 1/0} returns 0). The {@code __safe} lambda's try/catch
- *       runs inside compiled bytecode and catches them properly.</li>
+ *   <li>Stock {@code LocalExecutionControl} uses {@code Method.invoke} for the
+ *       synthesized {@code do_it$} call. CheerpJ's WASM reflection drops the
+ *       thrown {@code InvocationTargetException} — so {@code SnippetEvent
+ *       .value()} and {@code .exception()} both come back null and user-code
+ *       failures vanish. We swap in {@link jdk.jshell.execution.MhExecutionControl}
+ *       which invokes via {@link java.lang.invoke.MethodHandle#invokeWithArguments};
+ *       that path propagates the exception correctly and JShell wires up the
+ *       SnippetEvent normally.</li>
  *   <li>{@code shell.close() + new JShell.builder().build()} is hardcoded to
  *       ~15 cycles per page; after that, javac's {@code Names.Table} corrupts.
  *       Soft reset (drop snippets, keep JShell alive) bypasses this; hard
@@ -26,6 +23,12 @@ import java.util.*;
  *   <li>Stdout is routed to a {@code #console} DOM element, not the Java
  *       {@code PrintStream}. {@link SwitchOutputStream} captures when
  *       {@code capturing=true}; JS reads both sources.</li>
+ *   <li>Two remaining CheerpJ WASM-opcode bugs we can't easily fix at the
+ *       bridge level (documented as canary tests in {@code /test-errors}):
+ *       {@code IREM} with zero divisor returns 0 instead of trapping; {@code
+ *       NEWARRAY} with negative size throws {@code ArithmeticException} instead
+ *       of {@code NegativeArraySizeException}. JVM-thrown exceptions also tend
+ *       to come through with a null message.</li>
  * </ul>
  */
 public class JShellBridge {
@@ -88,7 +91,11 @@ public class JShellBridge {
             System.setOut(switchStream);
             System.setErr(switchStream);
             shell = JShell.builder()
-                .executionEngine("local")  // Run snippets in-process (not via JDI)
+                // Custom ExecutionControl: invokes do_it$ via MethodHandle so
+                // user exceptions propagate to SnippetEvent.exception() (CheerpJ
+                // drops them through Method.invoke). See MhExecutionControl.
+                .executionEngine(new jdk.jshell.execution.MhExecutionControl.Provider(),
+                    java.util.Map.of())
                 .out(switchStream)         // JShell execution engine output
                 .err(switchStream)         // JShell execution engine errors
                 .build();
@@ -101,76 +108,28 @@ public class JShellBridge {
         }
     }
 
-    /**
-     * Install the bridge's three helper snippets plus default auto-imports:
-     * <ul>
-     *   <li>{@code __threw} — flag set by {@code __safe} when its supplier throws.</li>
-     *   <li>{@code __safe(Supplier&lt;T&gt;)} — runs the supplier inside compiled
-     *       bytecode try/catch and prints exceptions in jshell format.</li>
-     *   <li>{@code __trigger()} — void no-op called via {@link #triggerClinit}
-     *       to flush pending {@code <clinit>}s. Must be a void method call —
-     *       any value-producing statement (e.g. {@code x++;}) gets auto-named
-     *       as {@code $N} by jshell, polluting the user's scratch namespace.</li>
-     * </ul>
-     */
+    /** Install the bridge's default auto-imports (same set as real jshell's
+     *  DEFAULT startup). The earlier {@code __safe}/{@code __threw}/{@code __trigger}
+     *  helpers are gone — MhExecutionControl surfaces user exceptions via
+     *  {@code SnippetEvent.exception()} natively. */
     private static void initFormatter() {
-        shell.eval("boolean __threw = false;");
-        // Exception output: "|  Exception java.lang.X: msg" (or no ": msg" when null) — matches jshell.
-        shell.eval(
-            "<T> T __safe(java.util.function.Supplier<T> s) { "
-            + "__threw = false; "
-            + "try { return s.get(); } catch (Throwable __e) { "
-            + "__threw = true; "
-            + "System.out.println(\"" + JSHELL_PREFIX + "Exception \" + __e.getClass().getName() "
-            + "+ (__e.getMessage() == null ? \"\" : \": \" + __e.getMessage())); "
-            + "return null; } }"
-        );
-        shell.eval("void __trigger() {}");
         for (String pkg : DEFAULT_IMPORT_NAMES) {
             shell.eval("import " + pkg + ";");
         }
     }
 
     /**
-     * Flush pending {@code <clinit>}s. Without this, {@link JShell#varValue}
-     * on a freshly-declared variable returns the type default (0/null/false)
-     * because CheerpJ runs reflection before the synthetic class's static
-     * initializer fires.
-     */
-    private static void triggerClinit() {
-        try { shell.eval("__trigger();"); } catch (Throwable ignore) {}
-    }
-
-    /** Look up the currently-VALID VarSnippet by name, or null if not found. */
-    private static VarSnippet findVar(String name) {
-        // Filter to VALID only — a redeclared var leaves an OVERWRITTEN snippet
-        // behind; findFirst() could otherwise return the stale one.
-        return shell.variables()
-            .filter(vs -> vs.name().equals(name))
-            .filter(vs -> shell.status(vs) == Snippet.Status.VALID)
-            .findFirst().orElse(null);
-    }
-
-    /** Read a top-level var's formatted value via shell.varValue. */
-    private static String readVarValue(String name) {
-        VarSnippet vs = findVar(name);
-        if (vs == null) return "(no VALID var named " + name + ")";
-        try { return shell.varValue(vs); }
-        catch (Throwable t) { return "(read error: " + t.getMessage() + ")"; }
-    }
-
-    /**
      * Evaluate user input. Multi-statement input is split via
-     * {@link SourceCodeAnalysis}; each snippet is dispatched in three tiers:
+     * {@link SourceCodeAnalysis}; each snippet is dispatched in two passes:
      * <ol>
-     *   <li>{@code throw} statements — wrapped in compiled-bytecode try/catch
-     *       so the exception is reported (CheerpJ otherwise swallows it).</li>
-     *   <li>Expressions — wrapped as {@code var $N = __safe(() -&gt; (expr))},
-     *       which both captures the value as a real top-level var (so the user
-     *       can reference {@code $N} later) and catches exceptions inside the
-     *       supplier's compiled bytecode.</li>
-     *   <li>Anything else — declarations, statements, control flow — handled
-     *       directly by {@link #evalOneSnippet}.</li>
+     *   <li>{@link #tryEvalAsExpression} — wraps the snippet as
+     *       {@code var $N = (expr);} so the value is captured as a real
+     *       top-level var the user can reference. Returns false when the
+     *       input isn't a wrappable expression (declarations, control flow,
+     *       imports, throws, void method calls).</li>
+     *   <li>{@link #evalOneSnippet} — handles everything tier 1 rejected.
+     *       Runtime exceptions surface via {@code SnippetEvent.exception()}
+     *       (powered by {@link jdk.jshell.execution.MhExecutionControl}).</li>
      * </ol>
      * Errors are prefixed with {@code @@ERR@@} per line so the JS layer can
      * style them distinctly.
@@ -202,16 +161,12 @@ public class JShellBridge {
                     String src = ci.source();
                     String srcTrimmed = src.trim().replaceAll(";$", "").trim();
 
-                    // Tier 1: throw statements — wrap in try/catch. Output
-                    // format matches real JShell (see JSHELL_PREFIX).
-                    if (srcTrimmed.startsWith("throw ")) {
-                        shell.eval("try { " + src + " } catch (Throwable __e) { "
-                            + "System.out.println(\"" + JSHELL_PREFIX + "Exception \" + __e.getClass().getName() "
-                            + "+ (__e.getMessage() == null ? \"\" : \": \" + __e.getMessage())); }");
-                    }
-                    // Tier 2: try as expression with try/catch value capture
-                    else if (!tryEvalAsExpression(srcTrimmed, errors)) {
-                        // Tier 3: not an expression — declarations, statements, control flow
+                    // Try as an expression first (captures value as $N); if that
+                    // path rejects (declarations, statements, control flow,
+                    // imports, throws), fall through to evalOneSnippet, which
+                    // also handles runtime exceptions via SnippetEvent.exception()
+                    // — surfaced by MhExecutionControl's MethodHandle invoke.
+                    if (!tryEvalAsExpression(srcTrimmed, errors)) {
                         evalOneSnippet(src, errors);
                     }
 
@@ -294,13 +249,9 @@ public class JShellBridge {
     /**
      * Detect source that clearly isn't an expression: imports, statement
      * keywords, typed variable declarations, method/class declarations.
-     *
-     * These must not be wrapped as `var $N = __safe(() -> (src))` because
-     * placing a non-expression inside a lambda body lets javac's
-     * error-recovery path reach ConstFold, which can throw a javac
-     * InternalError ("Exception during analyze - ArithmeticException")
-     * and corrupt JShell's compiler state — breaking every subsequent
-     * snippet that uses generics or lambdas.
+     * Used to short-circuit {@link #tryEvalAsExpression} — wrapping these
+     * as {@code var $N = (src);} would just generate a javac error and
+     * waste a compile cycle before falling through to {@link #evalOneSnippet}.
      */
     private static boolean looksLikeDeclaration(String expr) {
         String s = expr.trim().replaceAll(";$", "").trim();
@@ -328,66 +279,143 @@ public class JShellBridge {
     }
 
     /**
-     * Try to evaluate {@code expr} as an expression. Returns true on success;
-     * false if jshell rejects it (caller falls back to {@link #evalOneSnippet}).
-     *
-     * <p>The display name pattern follows real jshell:
-     * <pre>
-     *   "x"       → "x ==> value"    (bare identifier)
-     *   "x = 10"  → "x ==> value"    (assignment)
-     *   "x + 5"   → "$N ==> value"   (scratch — N is the auto-counter)
-     * </pre>
+     * Wrap a scratch expression as {@code var $N = (expr);} so the value
+     * persists as {@code $N} for later use. Returns true if handled; false
+     * to fall back to {@link #evalOneSnippet} for anything that isn't a
+     * value-producing fresh expression — declarations, statements, void
+     * method calls, bare-identifier reads, assignments. JShell handles
+     * those last two natively as ExpressionSnippets (VAR_VALUE_SUBKIND /
+     * ASSIGNMENT_SUBKIND) and they get the same {@code name ==> value}
+     * display via {@link #evalOneSnippet}.
      */
     private static boolean tryEvalAsExpression(String expr, StringBuilder errors) {
-        scratchCounter++; // Always advance, matching real jshell's $N counter (even for bare reads).
+        scratchCounter++; // Advance for every snippet — matches real jshell's $N counter.
 
-        // Skip the __safe wrap for anything that isn't an expression. Wrapping
-        // a declaration inside a lambda body triggers bad javac error recovery
-        // (see looksLikeDeclaration). Return false so caller falls through to
-        // evalOneSnippet, which handles declarations natively.
+        // Short-circuit anything that isn't an expression — wrapping a
+        // declaration as `var $N = (decl);` would just generate a javac error.
+        // Return false so caller falls through to evalOneSnippet.
         if (looksLikeDeclaration(expr)) return false;
 
-        String displayName;
-        String varName;
         boolean isBareIdentifier = expr.matches("[a-zA-Z_$][a-zA-Z0-9_$]*")
             && !expr.equals("true") && !expr.equals("false") && !expr.equals("null");
         boolean isAssignment = expr.matches("[a-zA-Z_$][a-zA-Z0-9_$]*\\s*[+\\-*/%&|^]?=(?!=).*");
-        if (isBareIdentifier) {
-            displayName = expr;       // "x ==> value"
-            varName = "__s" + scratchCounter;
-        } else if (isAssignment) {
-            displayName = expr.replaceAll("\\s*[+\\-*/%&|^]?=.*", "");  // "x ==> value"
+
+        // Bare reads (`x`) — let JShell handle natively as an
+        // ExpressionSnippet (VAR_VALUE_SUBKIND); they then appear in /list
+        // like real jshell.
+        if (isBareIdentifier) return false;
+
+        // Assignments stay wrapped (despite the /list-visibility cost) for a
+        // boring reason: under our JShell library version, plain `x = 10`
+        // becomes an ASSIGNMENT_SUBKIND ExpressionSnippet (clean to display)
+        // but compound `x += 1` becomes a TEMP_VAR_EXPRESSION_SUBKIND
+        // VarSnippet auto-named $<id>. Recovering the LHS for display in the
+        // compound case would mean source-pattern-matching the snippet — a
+        // hardcoded heuristic on top of a heuristic. Wrapping uniformly via
+        // __sN lets the LHS fall out of one regex up front. Trade-off:
+        // assignments don't get their own /list entries (they're hidden
+        // under the __sN prefix).
+        String displayName;
+        String varName;
+        if (isAssignment) {
+            displayName = expr.replaceAll("\\s*[+\\-*/%&|^]?=.*", "");
             varName = "__s" + scratchCounter;
         } else {
-            // Scratch expression: name the real var "$N" so the user can reference
-            // it in later snippets ($ is a legal Java identifier char).
-            displayName = "$" + scratchCounter;  // "$N ==> value"
+            displayName = "$" + scratchCounter;
             varName = "$" + scratchCounter;
         }
 
-        // Top-level `var $N = __safe(...)` so $N persists across snippets and
-        // the lambda body's try/catch lives in compiled bytecode (CheerpJ
-        // otherwise swallows runtime exceptions). REJECTED means the body
-        // wasn't a valid expression — caller falls back to evalOneSnippet.
-        String declaration = "var " + varName + " = __safe(() -> (" + expr + "));";
+        // Top-level `var $N = (expr);` so $N persists across snippets.
+        // Any runtime exception in the initializer is captured by
+        // MhExecutionControl and surfaced via SnippetEvent.exception().
+        // REJECTED means the body wasn't a valid expression — caller falls
+        // back to evalOneSnippet.
+        String declaration = "var " + varName + " = (" + expr + ");";
         List<SnippetEvent> events;
         try {
             events = shell.eval(declaration);
         } catch (Throwable t) {
-            // javac throws InternalError here for compile-time-constant arithmetic
-            // exceptions inside generic-method lambdas (e.g. `1/0`, `1%0`). Reporting
-            // it without re-running raw avoids silently creating $N=0 in CheerpJ.
             errors.append("Exception: ").append(t.getClass().getSimpleName())
                 .append(": ").append(t.getMessage()).append('\n');
             return true;
         }
         if (events.stream().noneMatch(e -> e.status() == Snippet.Status.VALID)) return false;
 
-        triggerClinit();
-        if (!"true".equals(readVarValue("__threw"))) {
-            bufferWrite(displayName + " ==> " + readVarValue(varName) + "\n");
+        // Read the formatted result straight from the SnippetEvent. With
+        // MhExecutionControl, e.value() carries do_it$'s return — already
+        // formatted by JShell's valueString (same routine that backs
+        // shell.varValue). If the initializer threw, real jshell leaves $N
+        // declared with its type default but doesn't emit the "$N ==> ..."
+        // line — only the exception.
+        for (SnippetEvent ev : events) {
+            if (ev.snippet() == null || ev.causeSnippet() != null) continue;
+            if (ev.exception() != null) {
+                printException(ev.exception());
+                return true;
+            }
+            if (ev.snippet() instanceof VarSnippet) {
+                bufferWrite(displayName + " ==> " + ev.value() + "\n");
+                return true;
+            }
         }
         return true;
+    }
+
+    /** Render a captured user exception in jshell format. Shared by the
+     *  tryEvalAsExpression and evalOneSnippet paths.
+     *
+     *  Format matches real jshell:
+     *  <pre>
+     *    |  Exception java.lang.ArithmeticException: / by zero
+     *    |        at divide (#1:1)
+     *    |        at (#2:1)
+     *  </pre>
+     *
+     *  JShell translates the raw StackTraceElement[] to use {@code #<snippet-id>}
+     *  as the className and the user-visible method name (with {@code do_it$}
+     *  → top-level rendering as just the {@code at (#N:L)} form). We filter to
+     *  snippet-mapped frames only; JVM/library frames don't appear in jshell. */
+    private static void printException(jdk.jshell.JShellException je) {
+        // Make sure the user-id map covers everything snippets currently knows
+        // about — stack frames may reference snippets just created by this eval.
+        syncUserIds();
+
+        String exClass = je.getClass().getName();
+        if (je instanceof jdk.jshell.EvalException ev) {
+            exClass = ev.getExceptionClassName();
+        }
+        String msg = je.getLocalizedMessage();
+        bufferWrite(JSHELL_PREFIX + "Exception " + exClass
+            + (msg != null ? ": " + msg : "") + "\n");
+
+        for (StackTraceElement frame : je.getStackTrace()) {
+            // JShell stamps the snippet ID as "#N" — empirically it lands in
+            // fileName under CheerpJ (real JDK puts it in className). Accept
+            // either; skip frames where it's in neither (JVM/library frames
+            // that jshell hides too).
+            String className = frame.getClassName();
+            String fileName = frame.getFileName();
+            String rawId =
+                (className != null && className.startsWith("#")) ? className :
+                (fileName != null && fileName.startsWith("#")) ? fileName :
+                null;
+            if (rawId == null) continue;
+            String method = frame.getMethodName();
+            String methodPart = (method != null && !method.isEmpty() && !method.equals("do_it$"))
+                ? method + " " : "";
+            bufferWrite(JSHELL_PREFIX + "      at " + methodPart
+                + "(" + toUserSnippetId(rawId) + ":" + frame.getLineNumber() + ")\n");
+        }
+    }
+
+    /** Translate JShell's internal snippet id ("#26") into the user-facing
+     *  one shown by /list ("#3"). Falls back to the raw id when the map
+     *  doesn't know it (which would be an infrastructure snippet — those
+     *  filter out of /list anyway). */
+    private static String toUserSnippetId(String rawHashId) {
+        String internal = rawHashId.substring(1);
+        Integer user = userIdByRealId.get(internal);
+        return user != null ? "#" + user : rawHashId;
     }
 
     /**
@@ -407,13 +435,19 @@ public class JShellBridge {
             return;
         }
 
-        // Phase 2: iterate events, collect what needs displaying
-        List<VarSnippet> varsToShow = new ArrayList<>();
-        List<ExpressionSnippet> exprsToShow = new ArrayList<>();
-
+        // Phase 2: iterate events. Values come straight from e.value() —
+        // MhExecutionControl makes that the do_it$ return, already formatted
+        // by JShell's valueString (the same routine that backs shell.varValue).
         for (SnippetEvent e : events) {
             Snippet s = e.snippet();
             if (s == null || e.causeSnippet() != null) continue;  // Skip secondary (cascade) events
+
+            // User-code runtime exception, captured by MhExecutionControl
+            // (via MethodHandle.invokeWithArguments) and surfaced here as
+            // event.exception(). With stock LocalExecutionControl this is
+            // always null under CheerpJ.
+            boolean threwInInit = e.exception() != null;
+            if (threwInInit) printException(e.exception());
 
             Snippet.Status status = e.status();
 
@@ -464,12 +498,21 @@ public class JShellBridge {
                     || status == Snippet.Status.RECOVERABLE_NOT_DEFINED) {
 
                 if (s instanceof VarSnippet vs) {
-                    // Variable declaration or temp var from expression
-                    varsToShow.add(vs);
+                    // Variable declaration. When the initializer threw, real
+                    // jshell skips the "name ==> value" line (var still exists
+                    // at its type default; the exception line stands alone).
+                    if (!threwInInit) {
+                        bufferWrite(vs.name() + " ==> " + e.value() + "\n");
+                    }
 
                 } else if (s instanceof ExpressionSnippet es) {
-                    // Bare variable reference (e.g., "x", "list") — VAR_VALUE_SUBKIND
-                    exprsToShow.add(es);
+                    // VAR_VALUE_SUBKIND — bare ident read (`x`). Assignments
+                    // are wrapped in tryEvalAsExpression and so don't reach
+                    // here as ExpressionSnippets.
+                    if (!threwInInit) {
+                        String shown = es.source().trim().replaceAll(";$", "").trim();
+                        bufferWrite(shown + " ==> " + e.value() + "\n");
+                    }
 
                 } else if (s instanceof MethodSnippet ms) {
                     boolean isNew = e.previousStatus() == Snippet.Status.NONEXISTENT;
@@ -513,37 +556,6 @@ public class JShellBridge {
             }
         }
 
-        // Phase 3: emit "name ==> value" lines via shell.varValue.
-        // One triggerClinit() call covers every var declared in this eval
-        // (they share the same pending-init batch).
-
-        if (!varsToShow.isEmpty() || !exprsToShow.isEmpty()) {
-            triggerClinit();
-        }
-
-        for (VarSnippet vs : varsToShow) {
-            try {
-                bufferWrite(vs.name() + " ==> " + shell.varValue(vs) + "\n");
-            } catch (Throwable t) {
-                errors.append("Error reading ").append(vs.name()).append(": ").append(t).append('\n');
-            }
-        }
-
-        // ExpressionSnippet: bare expression that produced a value but wasn't
-        // assigned. Declare a throwaway VarSnippet and read that.
-        for (ExpressionSnippet es : exprsToShow) {
-            String expr = es.source().trim().replaceAll(";$", "");
-            try {
-                shell.eval("var __tmp_expr = (" + expr + ");");
-                triggerClinit();
-                VarSnippet tmp = findVar("__tmp_expr");
-                if (tmp != null) {
-                    bufferWrite(expr + " ==> " + shell.varValue(tmp) + "\n");
-                }
-            } catch (Throwable t) {
-                errors.append("Error displaying ").append(expr).append(": ").append(t).append('\n');
-            }
-        }
     }
 
     /**
@@ -605,17 +617,251 @@ public class JShellBridge {
     }
 
     // ============================================================
+    // Snippet listing commands — /list, /vars, /methods, /types, /imports, /drop.
+    //
+    // All use shell.snippets()/variables()/methods()/types()/imports() and
+    // shell.varValue() — the same paths our eval feedback uses, which are
+    // known to work under CheerpJ. Output format matches real jshell's
+    // --feedback normal mode.
+    //
+    // Bridge infrastructure (snippets whose name starts with "__") and our
+    // DEFAULT_IMPORT_NAMES are filtered out so the user sees only their own
+    // state, except in /imports which mirrors real jshell by including the
+    // startup imports.
+    // ============================================================
+
+    private static boolean isHiddenInfra(Snippet s) {
+        if (s instanceof VarSnippet vs) return vs.name().startsWith("__");
+        if (s instanceof MethodSnippet ms) return ms.name().startsWith("__");
+        // Catch any statement snippets whose source is purely a call into
+        // bridge infrastructure (e.g. leftover __trigger() from older runs).
+        if (s instanceof StatementSnippet) {
+            String src = s.source().trim();
+            return src.startsWith("__");
+        }
+        return false;
+    }
+
+    /** True when a snippet should appear in user-facing /list output. */
+    private static boolean isUserVisible(Snippet s) {
+        if (isHiddenInfra(s)) return false;
+        if (s instanceof ImportSnippet is && DEFAULT_IMPORT_NAMES.contains(is.name())) return false;
+        return true;
+    }
+
+    // ============================================================
+    // User-facing snippet IDs.
+    //
+    // jshell's real Snippet.id() starts at 1 and increments per eval —
+    // including the bridge's default-import setup — so a user's first
+    // input lands at ~11. We shadow real IDs with our own monotonic
+    // counter that only advances for user-visible snippets, giving
+    // 1, 2, 3 in /list output.
+    //
+    // IDs are assigned lazily and once-only when a snippet is first seen
+    // active by syncUserIds(). Dropping or overwriting a snippet does not
+    // reuse its user ID, matching real jshell. A reset() clears the map
+    // and the counter restarts at 1.
+    // ============================================================
+
+    private static final Map<String, Integer> userIdByRealId = new LinkedHashMap<>();
+    private static int nextUserId = 1;
+
+    private static void syncUserIds() {
+        shell.snippets()
+            .filter(s -> shell.status(s).isActive())
+            .filter(JShellBridge::isUserVisible)
+            .forEach(s -> userIdByRealId.computeIfAbsent(s.id(), k -> nextUserId++));
+    }
+
+    private static void clearUserIdMap() {
+        userIdByRealId.clear();
+        nextUserId = 1;
+    }
+
+    /** /list — user-facing id + source, like {@code "   1 : int x = 2"}. */
+    public static String listAll() {
+        if (shell == null) return "ERROR: JShell not initialized";
+        syncUserIds();
+        StringBuilder sb = new StringBuilder();
+        shell.snippets()
+            .filter(s -> shell.status(s).isActive())
+            .filter(JShellBridge::isUserVisible)
+            .forEach(s -> {
+                Integer uid = userIdByRealId.get(s.id());
+                String src = unwrapScratchSource(s.source());
+                while (src.endsWith("\n") || src.endsWith("\r")) src = src.substring(0, src.length() - 1);
+                sb.append(String.format("%4d : %s%n", uid != null ? uid : 0, src));
+            });
+        return sb.toString();
+    }
+
+    /** Pattern: `var <scratch-name> = (EXPR);` where scratch-name is one of
+     *  our bridge-internal names ($N or __sN). Lets /list show the user's
+     *  original expression instead of our wrap. Group 1 = the expression. */
+    private static final java.util.regex.Pattern SCRATCH_WRAP =
+        java.util.regex.Pattern.compile("^var (?:\\$\\d+|__s\\d+) = \\((.*)\\);\\s*$",
+            java.util.regex.Pattern.DOTALL);
+
+    private static String unwrapScratchSource(String src) {
+        if (src == null) return src;
+        java.util.regex.Matcher m = SCRATCH_WRAP.matcher(src);
+        return m.matches() ? m.group(1) : src;
+    }
+
+    /** /vars — {@code "|    <type> <name> = <value>"} per active var. */
+    public static String listVars() {
+        if (shell == null) return "ERROR: JShell not initialized";
+        StringBuilder sb = new StringBuilder();
+        shell.variables()
+            .filter(vs -> shell.status(vs).isActive())
+            .filter(vs -> !vs.name().startsWith("__"))
+            .forEach(vs -> {
+                String val;
+                try { val = shell.varValue(vs); }
+                catch (Throwable t) { val = "?"; }
+                sb.append("|    ").append(vs.typeName()).append(' ').append(vs.name())
+                  .append(" = ").append(val).append('\n');
+            });
+        return sb.toString();
+    }
+
+    /** /methods — {@code "|    <returnType> <name>(<paramTypes>)"} per active method. */
+    public static String listMethods() {
+        if (shell == null) return "ERROR: JShell not initialized";
+        StringBuilder sb = new StringBuilder();
+        shell.methods()
+            .filter(ms -> shell.status(ms).isActive())
+            .filter(ms -> !ms.name().startsWith("__"))
+            .forEach(ms -> {
+                // MethodSnippet.signature() format is `(paramTypes)returnType`
+                // (e.g. `()void`, `(int,int)int`, `(String[])String`). Pull
+                // the return type from after the closing paren.
+                String sig = ms.signature();
+                int close = sig.lastIndexOf(')');
+                String returnType = close >= 0 ? sig.substring(close + 1) : sig;
+                sb.append("|    ").append(returnType)
+                  .append(' ').append(ms.name())
+                  .append('(').append(ms.parameterTypes()).append(")\n");
+            });
+        return sb.toString();
+    }
+
+    /** /types — {@code "|    class Foo"}, {@code "|    interface Bar"}, etc. */
+    public static String listTypes() {
+        if (shell == null) return "ERROR: JShell not initialized";
+        StringBuilder sb = new StringBuilder();
+        shell.types()
+            .filter(ts -> shell.status(ts).isActive())
+            .forEach(ts -> {
+                String kind = ts.subKind() == Snippet.SubKind.CLASS_SUBKIND ? "class"
+                    : ts.subKind() == Snippet.SubKind.INTERFACE_SUBKIND ? "interface"
+                    : ts.subKind() == Snippet.SubKind.ENUM_SUBKIND ? "enum"
+                    : ts.subKind() == Snippet.SubKind.RECORD_SUBKIND ? "record" : "type";
+                sb.append("|    ").append(kind).append(' ').append(ts.name()).append('\n');
+            });
+        return sb.toString();
+    }
+
+    /** /imports — including our DEFAULT_IMPORT_NAMES, matching real jshell which lists its startup imports. */
+    public static String listImports() {
+        if (shell == null) return "ERROR: JShell not initialized";
+        StringBuilder sb = new StringBuilder();
+        shell.imports()
+            .filter(is -> shell.status(is).isActive())
+            .forEach(is -> {
+                String src = is.source().trim();
+                while (src.endsWith(";")) src = src.substring(0, src.length() - 1).trim();
+                sb.append("|    ").append(src).append('\n');
+            });
+        return sb.toString();
+    }
+
+    /**
+     * /drop &lt;id-or-name&gt; — drop a single matching snippet. Numeric arg
+     * is interpreted as a user-facing id (the one shown by /list), then
+     * falls back to variable/method/type name.
+     */
+    public static String dropSnippet(String arg) {
+        if (shell == null) return "ERROR: JShell not initialized";
+        if (arg == null || arg.trim().isEmpty()) {
+            // Match real jshell's two-line message verbatim.
+            return JSHELL_PREFIX + "In the /drop argument, please specify an import, variable, method, or class to drop.\n"
+                + "Specify by ID or name. Use /list to see IDs. Use /reset to reset all state.\n";
+        }
+        String key = arg.trim();
+        syncUserIds();
+
+        Snippet target = null;
+        try {
+            int uid = Integer.parseInt(key);
+            String realId = userIdByRealId.entrySet().stream()
+                .filter(e -> e.getValue() == uid)
+                .map(Map.Entry::getKey)
+                .findFirst().orElse(null);
+            if (realId != null) {
+                target = shell.snippets()
+                    .filter(s -> shell.status(s).isActive())
+                    .filter(s -> s.id().equals(realId))
+                    .findFirst().orElse(null);
+            }
+        } catch (NumberFormatException ignore) { /* not numeric — try name */ }
+
+        if (target == null) {
+            target = shell.snippets()
+                .filter(s -> shell.status(s).isActive())
+                .filter(s -> !isHiddenInfra(s))
+                .filter(s -> {
+                    if (s instanceof VarSnippet vs) return vs.name().equals(key);
+                    if (s instanceof MethodSnippet ms) return ms.name().equals(key);
+                    if (s instanceof TypeDeclSnippet ts) return ts.name().equals(key);
+                    return false;
+                })
+                .findFirst().orElse(null);
+        }
+
+        if (target == null) {
+            // Real jshell prints a second hint line.
+            return JSHELL_PREFIX + "No such snippet: " + key + "\n"
+                + JSHELL_PREFIX + "See /types, /methods, /vars, or /list\n";
+        }
+
+        try { shell.drop(target); }
+        catch (Throwable t) { return JSHELL_PREFIX + "Error dropping " + key + ": " + t.getMessage() + "\n"; }
+
+        // Real jshell drop feedback: "|  dropped variable x" / "|  dropped method add(int,int)" / "|  dropped class Foo"
+        if (target instanceof VarSnippet vs) {
+            return JSHELL_PREFIX + "dropped variable " + vs.name() + "\n";
+        }
+        if (target instanceof MethodSnippet ms) {
+            return JSHELL_PREFIX + "dropped method " + ms.name() + "(" + ms.parameterTypes() + ")\n";
+        }
+        if (target instanceof TypeDeclSnippet ts) {
+            String kind = ts.subKind() == Snippet.SubKind.CLASS_SUBKIND ? "class"
+                : ts.subKind() == Snippet.SubKind.INTERFACE_SUBKIND ? "interface"
+                : ts.subKind() == Snippet.SubKind.ENUM_SUBKIND ? "enum"
+                : ts.subKind() == Snippet.SubKind.RECORD_SUBKIND ? "record" : "type";
+            return JSHELL_PREFIX + "dropped " + kind + " " + ts.name() + "\n";
+        }
+        return JSHELL_PREFIX + "dropped " + key + "\n";
+    }
+
+    // ============================================================
     // /probe — consolidated diagnostic.
     //
-    // Verifies the major CheerpJ-specific behaviors we depend on:
-    //   - shell.varValue() returns the real formatted value across types
-    //   - SnippetEvent.value() and .exception() are still null (broken)
+    // Verifies the bridge's core invariants on the running CheerpJ build:
+    //   - shell.varValue() formats every primitive/reference type correctly
+    //   - SnippetEvent.value() and .exception() reach us (MhExecutionControl)
     //   - hybrid reset budget state (how many hard resets are left)
+    //
+    // The probe cleans up after itself — all snippets it evaluates are
+    // dropped before returning so /list and /vars stay user-only.
     // ============================================================
     public static String probe() {
         if (shell == null) return "ERROR: JShell not initialized";
         StringBuilder sb = new StringBuilder();
         sb.append("=== JShell-on-CheerpJ probe ===\n");
+        List<Snippet> probeSnippets = new ArrayList<>();
         try {
             // --- Hybrid reset budget ---
             sb.append("\n[1] Hybrid reset budget\n");
@@ -638,8 +884,11 @@ public class JShellBridge {
                 "java.util.List<Integer> __px_list = java.util.List.of(1,2,3)",
                 "Class<?> __px_cls = String.class"
             };
-            for (String d : decls) shell.eval(d + ";");
-            triggerClinit();
+            for (String d : decls) {
+                for (SnippetEvent e : shell.eval(d + ";")) {
+                    if (e.snippet() != null && e.causeSnippet() == null) probeSnippets.add(e.snippet());
+                }
+            }
             for (VarSnippet vs : shell.variables().toList()) {
                 if (!vs.name().startsWith("__px_")) continue;
                 String val;
@@ -647,28 +896,38 @@ public class JShellBridge {
                 catch (Throwable t) { val = "ERR " + t.getClass().getSimpleName(); }
                 sb.append(String.format("    %-32s -> %s%n", vs.typeName() + " " + vs.name(), val));
             }
-            // Drop the probe vars to keep the session clean
-            for (VarSnippet vs : shell.variables().toList()) {
-                if (vs.name().startsWith("__px_")) {
-                    try { shell.drop(vs); } catch (Throwable ignore) {}
-                }
-            }
 
-            // --- SnippetEvent value/exception ---
-            sb.append("\n[3] SnippetEvent.value() / .exception() (expected: both null in CheerpJ)\n");
+            // --- SnippetEvent value/exception (MhExecutionControl) ---
+            sb.append("\n[3] SnippetEvent (MhExecutionControl effect)\n");
             for (SnippetEvent e : shell.eval("40 + 2;")) {
                 if (e.snippet() == null || e.causeSnippet() != null) continue;
+                probeSnippets.add(e.snippet());
                 sb.append("    eval('40 + 2').value():       ")
-                  .append(e.value() == null ? "null" : "'" + e.value() + "'").append('\n');
+                  .append(e.value() == null ? "null  ✗ MhExecutionControl NOT delivering value"
+                                            : "'" + e.value() + "'  ✓ value() reaches us").append('\n');
             }
-            for (SnippetEvent e : shell.eval("throw new RuntimeException(\"x\");")) {
+            for (SnippetEvent e : shell.eval("throw new RuntimeException(\"x-boom\");")) {
                 if (e.snippet() == null || e.causeSnippet() != null) continue;
-                sb.append("    eval('throw...').exception():  ")
-                  .append(e.exception() == null ? "null" : e.exception().getClass().getName())
-                  .append('\n');
+                probeSnippets.add(e.snippet());
+                String exc;
+                if (e.exception() == null) {
+                    exc = "null  ✗ MhExecutionControl NOT delivering exception";
+                } else {
+                    String cls = e.exception().getClass().getSimpleName();
+                    if (e.exception() instanceof jdk.jshell.EvalException ev) {
+                        cls += " (cause: " + ev.getExceptionClassName() + ")";
+                    }
+                    exc = cls + "  ✓ exception() reaches us";
+                }
+                sb.append("    eval('throw...').exception(): ").append(exc).append('\n');
             }
         } catch (Throwable t) {
             sb.append("\nPROBE FAILED: ").append(t).append('\n');
+        } finally {
+            // Always drop probe-created snippets so /list stays user-only.
+            for (Snippet s : probeSnippets) {
+                try { shell.drop(s); } catch (Throwable ignore) {}
+            }
         }
         return sb.toString();
     }
@@ -695,12 +954,14 @@ public class JShellBridge {
     public static String reset() {
         try {
             scratchCounter = 0;
+            clearUserIdMap();
             if (shell == null) {
                 // First-time init path
                 System.setOut(switchStream);
                 System.setErr(switchStream);
                 shell = JShell.builder()
-                    .executionEngine("local")
+                    .executionEngine(new jdk.jshell.execution.MhExecutionControl.Provider(),
+                        java.util.Map.of())
                     .out(switchStream)
                     .err(switchStream)
                     .build();
@@ -723,7 +984,8 @@ public class JShellBridge {
                 System.setOut(switchStream);
                 System.setErr(switchStream);
                 shell = JShell.builder()
-                    .executionEngine("local")
+                    .executionEngine(new jdk.jshell.execution.MhExecutionControl.Provider(),
+                        java.util.Map.of())
                     .out(switchStream)
                     .err(switchStream)
                     .build();
@@ -738,26 +1000,16 @@ public class JShellBridge {
                 return "OK (hard reset " + hardResetCount + "/" + MAX_HARD_RESETS + ")";
             }
 
-            // Otherwise — soft reset (drop active user snippets only).
-            for (VarSnippet vs : shell.variables().toList()) {
-                if (!"__threw".equals(vs.name())) {
-                    try { shell.drop(vs); } catch (Throwable ignore) {}
-                }
-            }
-            for (MethodSnippet ms : shell.methods().toList()) {
-                String n = ms.name();
-                if (!"__safe".equals(n) && !"__trigger".equals(n)) {
-                    try { shell.drop(ms); } catch (Throwable ignore) {}
-                }
-            }
-            for (TypeDeclSnippet ts : shell.types().toList()) {
-                try { shell.drop(ts); } catch (Throwable ignore) {}
-            }
-            for (ImportSnippet is : shell.imports().toList()) {
-                // Keep our default auto-imports across resets — they're
-                // infrastructure, not user state.
-                if (DEFAULT_IMPORT_NAMES.contains(is.name())) continue;
-                try { shell.drop(is); } catch (Throwable ignore) {}
+            // Otherwise — soft reset: drop every active snippet (vars,
+            // methods, types, expression/statement snippets, non-default
+            // imports). shell.snippets() covers all snippet kinds; iterating
+            // it once is cleaner than per-type loops and catches the
+            // ExpressionSnippets / StatementSnippets that bare reads,
+            // assignments, and control-flow statements now produce.
+            for (Snippet s : shell.snippets().toList()) {
+                if (s instanceof ImportSnippet is
+                    && DEFAULT_IMPORT_NAMES.contains(is.name())) continue;
+                try { shell.drop(s); } catch (Throwable ignore) {}
             }
 
             // If user wanted hard but budget is exhausted, signal the JS side.

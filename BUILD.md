@@ -149,24 +149,35 @@ cp "$TEMP/jdk.jshell.jar" public/jdk.jshell.jar
 Verify: `javap -verbose /tmp/jshell17/classes/jdk/jshell/JShell.class | grep "major version"`
 → should be `61` (Java 17)
 
-## Build JShellBridge
+## Build the bridge
 
-Our bridge class that connects JavaScript to JShell:
+Our bridge code (JShellBridge + MhExecutionControl) is compiled and packaged
+into `precompiled/bridge.jar`:
 
 ```bash
-cd cheerpj-bridge && bash build.sh
+bash src/build.sh
 ```
 
-This compiles `src/JShellBridge.java` and copies the `.class` files to `public/precompiled/`.
+This does two `javac` passes:
+
+1. `MhExecutionControl` lives in package `jdk.jshell.execution` so it can
+   subclass `LocalExecutionControl` and override its `protected invoke(Method)`.
+   javac refuses to add classes to existing system modules from the classpath,
+   so the compile uses `--patch-module jdk.jshell=src/patch`.
+2. `JShellBridge` (default package) is compiled with the patched class on
+   classpath via the same `--patch-module` mechanism.
+
+Output goes to `precompiled/bridge.jar`, which is added to the CheerpJ classpath
+at runtime. JARs are used instead of loose `.class` files because CheerpJ's
+`cheerpOSAddStringFile` doesn't accept paths with subdirectories under `/str/`.
 
 ## File inventory
 
 | File | Size | Source |
 |---|---|---|
-| `public/jdk.compiler_17.jar` | 3.3MB | Extracted from Temurin JDK 17 `jdk.compiler` module |
-| `public/jdk.jshell.jar` | 2.3MB | Extracted from Temurin JDK 17 (8 modules + patches) |
-| `public/precompiled/JShellBridge.class` | 13KB | Our code (`cheerpj-bridge/src/JShellBridge.java`) |
-| `public/precompiled/JShellBridge$SwitchOutputStream.class` | 889B | Our code (named inner class) |
+| `jdk.compiler_17.jar` | 3.3MB | Extracted from Temurin JDK 17 `jdk.compiler` module |
+| `jdk.jshell.jar` | 2.3MB | Extracted from Temurin JDK 17 (8 modules + patches) |
+| `precompiled/bridge.jar` | ~16KB | Our bridge + MhExecutionControl, compiled by `src/build.sh` |
 
 ## CheerpJ runtime
 

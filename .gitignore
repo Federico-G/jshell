@@ -4,6 +4,7 @@ src/build/
 # IDEs
 .idea/
 .vscode/
+.claude/
 *.iml
 
 # OS

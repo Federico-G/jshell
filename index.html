@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-    <title>JShell — Java 17 in the Browser</title>
+    <title>JShell in the Browser</title>
     <script src="https://cjrtnc.leaningtech.com/4.2/loader.js"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -148,11 +148,15 @@
         }
 
         function showInput(code) {
+            // Real jshell prints a blank line before each new prompt (after
+            // the first). Prepend a literal '\n' so it survives copy-paste,
+            // not just CSS spacing.
+            const hasPrevious = outputEl.querySelector('.entry.input') !== null;
             const lines = esc(code).split('\n');
             const html = lines.map((line, i) =>
                 `<span class="prompt">${i === 0 ? 'jshell&gt;' : '   ...'}</span> <span class="input-text">${line}</span>`
             ).join('\n');
-            appendToOutput(`<div class="entry">${html}</div>`);
+            appendToOutput(`<div class="entry input">${hasPrevious ? '\n' : ''}${html}</div>`);
         }
 
         function showOutput(text) {
@@ -193,24 +197,18 @@
         // ============================================================
         // Engine
         // ============================================================
-        async function loadPrecompiled(className) {
-            const resp = await fetch(`precompiled/${className}.class`);
-            if (!resp.ok) throw new Error(`Failed to load ${className}.class`);
-            cheerpOSAddStringFile(`/str/${className}.class`, new Uint8Array(await resp.arrayBuffer()));
-        }
-
         async function initEngine() {
             loadingStatus.innerHTML = 'Initializing CheerpJ<span class="dots"><span>.</span><span>.</span><span>.</span></span>';
             await cheerpjInit({ status: 'none', version: 17 });
 
-            loadingStatus.innerHTML = 'Loading JShell<span class="dots"><span>.</span><span>.</span><span>.</span></span>';
-            await loadPrecompiled('JShellBridge');
-            await loadPrecompiled('JShellBridge$SwitchOutputStream');
-
             loadingStatus.innerHTML = 'Starting JShell<span class="dots"><span>.</span><span>.</span><span>.</span></span>';
+            // bridge.jar contains JShellBridge (default package) and the
+            // MhExecutionControl patch in jdk.jshell.execution. CheerpJ's
+            // cheerpOSAddStringFile can't write to nested paths under /str/,
+            // so we put the patched class in a JAR on the classpath instead.
             const jar = (name) => '/app' + new URL(name, location.href).pathname;
             const lib = await cheerpjRunLibrary(
-                jar('jdk.jshell.jar') + ':' + jar('jdk.compiler_17.jar') + ':/str/');
+                jar('jdk.jshell.jar') + ':' + jar('jdk.compiler_17.jar') + ':' + jar('precompiled/bridge.jar'));
             jshellBridge = await lib.JShellBridge;
 
             const initResult = await jshellBridge.init();
@@ -256,10 +254,17 @@
             catch (e) { /* ignore */ }
         }
 
-        const USER_HELP = `/help     — show this help
-/clear    — clear the console
-/reset    — reset JShell session (clear all state)
-/dev      — enable developer mode
+        const USER_HELP = `/help           — show this help
+/list           — list active snippets with their IDs
+/vars           — list declared variables and their values
+/methods        — list declared methods and their signatures
+/types          — list declared types
+/imports        — list imported items
+/drop <id|name> — drop a snippet
+/history        — show input history
+/clear          — clear the console
+/reset          — reset JShell session (clear all state)
+/dev            — enable developer mode
 
 Type Java code and press Enter.
 
@@ -268,10 +273,17 @@ Shortcuts:
   Shift+Enter  — new line
   Up/Down      — command history`;
 
-        const DEV_HELP = `/help     — show this help
-/clear    — clear the console
-/reset    — reset JShell session (clear all state)
-/dev      — toggle developer mode (currently ON)
+        const DEV_HELP = `/help           — show this help
+/list           — list active snippets with their IDs
+/vars           — list declared variables and their values
+/methods        — list declared methods and their signatures
+/types          — list declared types
+/imports        — list imported items
+/drop <id|name> — drop a snippet
+/history        — show input history
+/clear          — clear the console
+/reset          — reset JShell session (clear all state)
+/dev            — toggle developer mode (currently ON)
 /test           — run all 5 test suites
 /test-language  — Java language features
 /test-format    — value display format
@@ -312,6 +324,43 @@ Shortcuts:
                 // Match real jshell's invalid-command format
                 showError('|  Invalid command: ' + cmd);
                 showError('|  Type /help for help.');
+            }
+        }
+
+        // /list, /vars, /methods, /types, /imports, /drop — dispatch to bridge
+        // (read-only views over JShell state). /history is JS-side from the
+        // input history array. Output is rendered via showOutput so it picks
+        // up the same styling as eval results.
+        async function runListCommand(cmd) {
+            try {
+                let out = '';
+                if (cmd === '/list') {
+                    const r = await jshellBridge.listAll();
+                    out = r != null ? await r.toString() : '';
+                } else if (cmd === '/vars') {
+                    const r = await jshellBridge.listVars();
+                    out = r != null ? await r.toString() : '';
+                } else if (cmd === '/methods') {
+                    const r = await jshellBridge.listMethods();
+                    out = r != null ? await r.toString() : '';
+                } else if (cmd === '/types') {
+                    const r = await jshellBridge.listTypes();
+                    out = r != null ? await r.toString() : '';
+                } else if (cmd === '/imports') {
+                    const r = await jshellBridge.listImports();
+                    out = r != null ? await r.toString() : '';
+                } else if (cmd === '/history') {
+                    // Include every input — real jshell shows the /history
+                    // command itself at the end of its own output.
+                    out = history.join('\n') + (history.length ? '\n' : '');
+                } else if (cmd.startsWith('/drop')) {
+                    const arg = cmd.replace(/^\/drop\s*/, '');
+                    const r = await jshellBridge.dropSnippet(arg);
+                    out = r != null ? await r.toString() : '';
+                }
+                if (out && out.trim()) showOutput(out.replace(/\n$/, ''));
+            } catch (e) {
+                showError(cmd + ' threw: ' + (e && e.stack ? e.stack : e));
             }
         }
 
@@ -385,6 +434,11 @@ Shortcuts:
                     }
                 } else if (trimmed.startsWith('/diag ')) {
                     await evalCode(trimmed, true);
+                } else if (trimmed === '/list' || trimmed === '/vars' || trimmed === '/methods'
+                        || trimmed === '/types' || trimmed === '/imports'
+                        || trimmed === '/history'
+                        || trimmed === '/drop' || trimmed.startsWith('/drop ')) {
+                    await runListCommand(trimmed);
                 } else {
                     handleCommand(trimmed);
                 }
@@ -633,6 +687,10 @@ Shortcuts:
             await test('LocalDate.of(2026, 1, 1).getYear()', $(2026), 'imported class');
 
             showInfo('\n--- Control flow ---');
+            // Statements pass through tryEvalAsExpression (which advances the
+            // counter at its top, even for inputs that early-out as
+            // non-expressions). Step 2 of the cleanup may collapse that
+            // unconditional bump; until then, skip() each statement.
             skip(); await test('if (true) System.out.println("ok")', 'ok', 'if stmt');
             skip(); await test('for (int i = 0; i < 3; i++) System.out.print(i)', '012', 'for loop');
             skip(); await test('int v = 10; v > 5 ? "big" : "small"', 'v ==> 10\n' + $('"big"'), 'ternary');
@@ -849,9 +907,11 @@ Shortcuts:
             await test('100', $(100), 'scratch counter continues normally');
 
             await jshellBridge.reset(); __n = 0;
-            showInfo('\n--- $N after throw (stores null; differs from real jshell) ---');
+            showInfo('\n--- $N after throw (type default, matches real jshell) ---');
             skip(); await test('1 / 0', 'ArithmeticException', 'div by zero printed', 'contains');
-            await test('$1', (__n++, '$1 ==> null'), '$1 = null after throw');
+            // Real jshell: $1 is declared with int's type default (0) — the
+            // initializer threw, so the field never got assigned but still exists.
+            await test('$1', (__n++, '$1 ==> 0'), '$1 = 0 (int default) after throw');
             await test('100', $(100), 'next scratch skips to $3');
         }
 
@@ -883,9 +943,37 @@ Shortcuts:
             skip(); await test('Math.addExact(Integer.MAX_VALUE, 1)', 'ArithmeticException', 'integer overflow', 'contains');
             skip(); await test('new int[-1]', 'NegativeArraySizeException', 'neg array size (CheerpJ canary: should fail)', 'contains');
             await test('throw new RuntimeException("boom")', 'RuntimeException', 'throw statement', 'contains');
+            // User-supplied exception message survives the MhExecutionControl
+            // round-trip (CheerpJ preserves it for explicitly-constructed
+            // exceptions; some JVM-thrown ones — `1/0`, OOB — drop it, see
+            // canaries above).
+            await test('throw new RuntimeException("with-msg")', ': with-msg', 'exception message preserved', 'contains');
+            // Stack frame line follows the exception in jshell format
+            // (`at (#N:L)`, mapped to user-facing snippet IDs).
+            await test('throw new IllegalStateException("framed")', 'at (#', 'exception includes stack frame', 'contains');
             await test('throw new IllegalStateException("state")', 'IllegalStateException', 'throw different subtype', 'contains');
-            skip(); await test('try { Integer.parseInt("x"); } catch (Exception e) { System.out.println("caught: " + e.getClass().getSimpleName()); }',
+            await test('try { Integer.parseInt("x"); } catch (Exception e) { System.out.println("caught: " + e.getClass().getSimpleName()); }',
                 'caught: NumberFormatException', 'try/catch in user code');
+
+            showInfo('\n--- Exceptions inside control-flow bodies ---');
+            // Runtime exceptions thrown inside for/while/do/if/try/bare-block
+            // bodies surface via SnippetEvent.exception(), captured by
+            // MhExecutionControl. (Pre-MhExecutionControl this section was a
+            // CheerpJ canary — exceptions were silently dropped by stock
+            // LocalExecutionControl.)
+            skip(); await test('int[] arr3 = {1, 2, 3}', 'arr3 ==> int[3] { 1, 2, 3 }', 'arr init');
+            await test('for (int i = 0; i < 5; i++) System.out.print(arr3[i])',
+                'ArrayIndexOutOfBoundsException', 'for-loop OOB surfaces (after partial output)', 'contains');
+            await test('for (int i = 0; i < 5; i++) System.out.print(arr3[i])',
+                '123', 'for-loop prints 3 values before throwing', 'contains');
+            await test('if (arr3.length > 0) System.out.print(arr3[10])',
+                'ArrayIndexOutOfBoundsException', 'if-statement OOB surfaces', 'contains');
+            await test('while (true) { throw new RuntimeException("w-boom"); }',
+                'w-boom', 'while-loop throw surfaces', 'contains');
+            await test('do { int x = arr3[99]; } while (false)',
+                'ArrayIndexOutOfBoundsException', 'do-while OOB surfaces', 'contains');
+            await test('{ int oops = arr3[7]; }',
+                'ArrayIndexOutOfBoundsException', 'bare-block OOB surfaces', 'contains');
 
             await jshellBridge.reset(); __n = 0;
             showInfo('\n--- Single-execution side effects ---');
